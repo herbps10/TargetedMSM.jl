@@ -1,0 +1,13 @@
+name = "TargetedMSM"
+uuid = "f25e3c76-d0cf-4df4-b64f-7237d3ea4578"
+authors = ["Herb Susmann <herbps10@gmail.com> and contributors"]
+version = "0.1.0"
+
+[compat]
+julia = "1"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
