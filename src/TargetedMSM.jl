@@ -4,6 +4,7 @@ using DataFrames
 using ForwardDiff
 using Optim
 using GLM
+using Statistics
 
 using Debugger
 
