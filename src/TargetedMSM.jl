@@ -1,12 +1,36 @@
 module TargetedMSM
 
+using LinearAlgebra
 using DataFrames
 using ForwardDiff
-using Optim
 using GLM
 using Statistics
+using Turing
+using Zygote
+using ChainRulesCore
+using NLsolve
+using AdvancedMH
 
 using Debugger
+
+function ChainRulesCore.rrule(config::RuleConfig{>:HasReverseMode}, ::typeof(nlsolve), f, x0; kwargs...)
+    result = nlsolve(f, x0; kwargs...)
+    function nlsolve_pullback(Δresult)
+        Δx = Δresult.zero
+        x = result.zero
+        _, f_pullback = rrule_via_ad(config, f, x)
+        JT(v) = f_pullback(v)[2] # w.r.t. x
+        # solve JT*Δfx = -Δx
+        Δfx = nlsolve(v -> JT(v) + Δx, zero(x); kwargs...).zero
+        ∂f = f_pullback(Δfx)[1] # w.r.t. f itself (implicitly closed-over variables)
+        return (NoTangent(), ∂f, ZeroTangent())
+    end
+    return result, nlsolve_pullback
+end
+
+function multiple_treatments(Y, A, X, g_formula, Q̄_formula, p, L::Function, m::Function)
+
+end
 
 """
     tmle(data, p::Integer, L, m, ℒ)
@@ -22,18 +46,25 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
     ddL(t, beta, X) = ForwardDiff.hessian(beta -> Lm(t, beta, X), beta)
     ∇dL(t, beta, X) = ForwardDiff.jacobian(t -> dL(first(t), beta, X), [t])
 
-    function sum_Lm(Ψ, Q, data::DataFrame, beta::Vector, Lm) 
+    # Number of observations
+    n = size(Y, 1)
+
+    # Empirical Distribution
+    Q = repeat([1.0 / n], n)
+
+    function sum_dL(Ψ, Q, X, beta::Vector, dL)
         l = 0
-        for i = 1:size(data, 1)
-            l += Q[i] * Lm(Ψ[i], beta, data[i, :])
+        for i=1:n
+            l = l .+ Q[i] * dL(Ψ[i], beta, X[i, :])
         end
         return l
     end
 
     # Parameter mapping
     function B(Ψ, Q)
-        optim = optimize(beta -> sum_Lm(Ψ, Q, data, beta, Lm), repeat([0.0], p), LBFGS(), autodiff = :forward)
-        Optim.minimizer(optim)
+        #optim = optimize(beta -> sum_Lm(Ψ, Q, data, beta, Lm), repeat([0.0], p), LBFGS(), autodiff = :forward)
+        #Optim.minimizer(optim)
+        nlsolve(beta -> sum_dL(Ψ, Q, X, beta, dL), repeat([0.0], p), autodiff = :forward).zero
     end
 
     function Δ(H, Y, Q̄)
@@ -54,12 +85,6 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
 
         return eif
     end
-
-    # Number of observations
-    n = size(Y, 1)
-
-    # Empirical Distribution
-    Q = repeat([1.0 / n], n)
 
     # Combine all data
     data  = hcat(DataFrame(Y = Y, A = A), X)
@@ -118,12 +143,70 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
     β_star_lower = β_star .- quantile(Normal(), 0.975) .* β_star_se ./ sqrt(n)
     β_star_upper = β_star .+ quantile(Normal(), 0.975) .* β_star_se ./ sqrt(n)
 
+    # Bayesian TMLE
+    @model function linear_fluctuation(p, Q̄, Q̄₀, Q̄₁, clever, clever0, clever1, K, Q, Y)
+        s² ~ InverseGamma(2, 3)
+        ϵ ~ filldist(Uniform(-1, 1), p)
+
+        # Fluctuate Q̄
+        Q̄_fluctuated = Q̄ .+ clever * ϵ
+        Q̄₀_fluctuated = Q̄₀ .+ clever0 * ϵ
+        Q̄₁_fluctuated = Q̄₁ .+ clever1 * ϵ
+        
+        ## Fluctuate Q
+        Q_normalization = sum(exp.(K * ϵ) .* Q)
+        Q_fluctuated  = exp.(K * ϵ) .* Q ./ Q_normalization
+        
+        ## Estimate Ψ
+        Ψ_fluctuated = Q̄₁_fluctuated - Q̄₀_fluctuated
+
+        # Estimate β
+        β_fluctuated = B(Ψ_fluctuated, Q_fluctuated)
+        #for i = 1:p
+        #   Turing.@addlogprob! loglikelihood(Normal(0, 1), β_fluctuated[i])
+        #end
+
+        Y ~ MvNormal(Q̄_fluctuated, sqrt(s²))
+        Turing.@addlogprob! sum(log.(Q_fluctuated))
+
+        return β_fluctuated
+    end
+
+    # Compute second clever covariate
+    K = zeros(n, p)
+    for i = 1:n
+        K[i, :] = dL(Ψ_star[i], β_star, X[i, :])
+    end
+
+    Turing.setadbackend(:zygote)
+    model = linear_fluctuation(p, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q, Y)
+    samples = sample(
+        model,
+        NUTS(250, 0.95),
+        #MH(
+        #    :s => x -> TruncatedNormal(x, 0.01, 0, Inf),
+        #    :ϵ => AdvancedMH.RandomWalkProposal(MultivariateNormal(repeat([0.0], p), diagm(repeat([0.01, p]))))
+        #),
+        MCMCThreads(),
+        250, 
+        4,
+        init_params = vcat([0.1], repeat([0.0], p))
+    )
+
+    beta_post = generated_quantities(model, samples)
+    beta_post = mapreduce(permutedims, vcat, reshape(beta_post, prod(size(beta_post)), 1))
+    beta_cis = mapslices(x -> quantile(x, [0.025, 0.975]), beta_post, dims = [1])
+
     return (
         epsilon = ϵ,
         beta = β_star,
         beta_se = β_star_se,
         beta_lower = β_star_lower,
-        beta_upper = β_star_upper
+        beta_upper = β_star_upper,
+        beta_post = beta_post,
+        beta_lower_bayes = beta_cis[1, :],
+        beta_upper_bayes = beta_cis[2, :],
+        samples = samples
     )
 end
 
