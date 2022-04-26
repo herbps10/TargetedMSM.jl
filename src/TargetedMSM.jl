@@ -5,32 +5,14 @@ using DataFrames
 using ForwardDiff
 using GLM
 using Statistics
-using Turing
-using Zygote
-using ChainRulesCore
+using Distributions
+using Random
 using NLsolve
-using AdvancedMH
+using Optim
 
-using Debugger
 
-function ChainRulesCore.rrule(config::RuleConfig{>:HasReverseMode}, ::typeof(nlsolve), f, x0; kwargs...)
-    result = nlsolve(f, x0; kwargs...)
-    function nlsolve_pullback(Δresult)
-        Δx = Δresult.zero
-        x = result.zero
-        _, f_pullback = rrule_via_ad(config, f, x)
-        JT(v) = f_pullback(v)[2] # w.r.t. x
-        # solve JT*Δfx = -Δx
-        Δfx = nlsolve(v -> JT(v) + Δx, zero(x); kwargs...).zero
-        ∂f = f_pullback(Δfx)[1] # w.r.t. f itself (implicitly closed-over variables)
-        return (NoTangent(), ∂f, ZeroTangent())
-    end
-    return result, nlsolve_pullback
-end
-
-function multiple_treatments(Y, A, X, g_formula, Q̄_formula, p, L::Function, m::Function)
-
-end
+logit(p) = log(p / (1 - p))
+inv_logit(p) = exp(p) / (exp(p) + 1)
 
 """
     tmle(data, p::Integer, L, m, ℒ)
@@ -38,13 +20,43 @@ end
     m(beta::Vector, X::DataFrameRow)
     L(t, Z::DataFrameRow)
 """
-function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Function, m::Function)
-    Lm(t, beta::Vector, X) = L(t, m(beta, X))
+function treatment_effect_modification(
+    Y, 
+    A, 
+    X, 
+    g_formula, 
+    Q̄_formula, 
+    var_formula, 
+    p, 
+    L::Function, 
+    m::Function;
+    linear = true,
+    bayes = false,
+    iterations::Int = 10_000, 
+    proposal_sd = nothing,
+    seed = 1, 
+    include_prior = true, 
+    prior = Normal(0, 1),
+    dL = nothing,
+    dL_dβ = nothing
+)
+
+    rng = MersenneTwister(seed)
+    Lm = (t, beta::Vector, X) -> L(t, m(beta, X))
 
     # Derivatives of loss function
-    dL(t, beta, X) = ForwardDiff.gradient(beta -> Lm(t, beta, X), beta)
+
+    if dL === nothing
+        dL = (t, beta, X) -> ForwardDiff.gradient(beta -> Lm(t, beta, X), beta)
+    end
+
     ddL(t, beta, X) = ForwardDiff.hessian(beta -> Lm(t, beta, X), beta)
     ∇dL(t, beta, X) = ForwardDiff.jacobian(t -> dL(first(t), beta, X), [t])
+    
+    if dL_dβ === nothing
+        dL_dβ_config = ForwardDiff.JacobianConfig(nothing, repeat([0.0], p))
+        dL_dβ = (t, beta, X) -> ForwardDiff.jacobian(β -> dL(t, β, X), beta, dL_dβ_config)
+    end
 
     # Number of observations
     n = size(Y, 1)
@@ -52,7 +64,7 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
     # Empirical Distribution
     Q = repeat([1.0 / n], n)
 
-    function sum_dL(Ψ, Q, X, beta::Vector, dL)
+    function objective(Ψ, Q, X, beta::Vector, dL)
         l = 0
         for i=1:n
             l = l .+ Q[i] * dL(Ψ[i], beta, X[i, :])
@@ -60,11 +72,44 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
         return l
     end
 
+    function dobjective_dΨ(Ψ, Q, X, beta::Vector, dL)
+        jacob = zeros(n, p)
+        for i in 1:n
+            jacob[i, :] = Q[i] * ∇dL(Ψ[i], beta, X[i, :])
+        end
+        return jacob
+    end
+
+    function dobjective_dQ(Ψ, Q, X, beta::Vector, dL)
+        jacob = zeros(n, p)
+        for i in 1:n
+            jacob[i, :] = dL(Ψ[i], beta, X[i, :])
+        end
+        return jacob
+    end
+
+    function dobjective_dbeta(Ψ, Q, X, beta::Vector, dL)
+        jacob = zeros(p, p)
+        for i in 1:n
+            jacob = jacob .+ Q[i] .* dL_dβ(Ψ[i], beta, X[i, :])
+        end
+        return jacob 
+    end
+
     # Parameter mapping
     function B(Ψ, Q)
         #optim = optimize(beta -> sum_Lm(Ψ, Q, data, beta, Lm), repeat([0.0], p), LBFGS(), autodiff = :forward)
         #Optim.minimizer(optim)
-        nlsolve(beta -> sum_dL(Ψ, Q, X, beta, dL), repeat([0.0], p), autodiff = :forward).zero
+
+        nlsolve(beta -> objective(Ψ, Q, X, beta, dL), repeat([0.0], p), autodiff = :forward, method = :newton).zero
+    end
+
+    function dB_dΨ(Ψ, Q, beta)
+        -dobjective_dΨ(Ψ, Q, X, beta, dL) * inv(dobjective_dbeta(Ψ, Q, X, beta, dL))
+    end
+
+    function dB_dQ(Ψ, Q, beta)
+        -dobjective_dQ(Ψ, Q, X, beta, dL) * inv(dobjective_dbeta(Ψ, Q, X, beta, dL))
     end
 
     function Δ(H, Y, Q̄)
@@ -96,9 +141,13 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
     g = predict(g_model)
 
     # Estimate Q̄
-    Q̄_model = lm(Q̄_formula, data)
+    if linear == true
+        Q̄_model = lm(Q̄_formula, data)
+    else 
+        Q̄_model = glm(Q̄_formula, data, Bernoulli(), LogitLink())
+    end
 
-    Q̄ = predict(Q̄_model)
+    Q̄  = predict(Q̄_model)
     Q̄₀ = predict(Q̄_model, data0)
     Q̄₁ = predict(Q̄_model, data1)
 
@@ -123,79 +172,223 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
         clever1[i, :] = H₁[i] .* d
     end
 
-    # Iterative algorithm
-    update = fit(GeneralizedLinearModel, clever, Y, Normal(), IdentityLink(), offset = Q̄)
-    ϵ = GLM.coef(update)
+    function Q_fluctuation(ϵ, K, Q)
+        Q_normalization = sum(exp.(K * ϵ) .* Q)
+        return exp.(K * ϵ) .* Q ./ Q_normalization
+    end
 
-    Q̄_star  = Q̄  .+ clever * ϵ
-    Q̄₀_star = Q̄₀ .+ clever0 * ϵ
-    Q̄₁_star = Q̄₁ .+ clever1 * ϵ
+    function dQ_fluctuation_dϵ(ϵ, K, Q)
+        Q_normalization = sum(exp.(K * ϵ) .* Q)
+        return Q_fluctuation(ϵ, K, Q) .* (K .- Q .* K .* exp.(K * ϵ) ./ Q_normalization)
+    end
 
-    Ψ_star = Q̄₁_star - Q̄₀_star 
+    # TODO: logistic response model
+    function model(ϵ, s, Q̄, Q̄₀, Q̄₁, clever, clever0, clever1, K, Q, Y; include_prior = false, linear = true)
+        target = 0
 
-    β_star = B(Ψ_star, Q)
+        # Fluctuate Q̄
+        if linear == true
+            Q̄_fluctuated  = Q̄  .+ (s .^ 2) .* clever * ϵ
+            Q̄₀_fluctuated = Q̄₀ .+ (s .^ 2) .* clever0 * ϵ
+            Q̄₁_fluctuated = Q̄₁ .+ (s .^ 2) .* clever1 * ϵ 
+        else
+            Q̄_fluctuated  = inv_logit.(logit.(Q̄)  .+ clever * ϵ)
+            Q̄₀_fluctuated = inv_logit.(logit.(Q̄₀) .+ clever0 * ϵ)
+            Q̄₁_fluctuated = inv_logit.(logit.(Q̄₁) .+ clever1 * ϵ)
+        end
+
+        # Estimate Ψ
+        Ψ_fluctuated = Q̄₁_fluctuated - Q̄₀_fluctuated
+
+        Q_fluctuated = Q_fluctuation(ϵ, K, Q)
+
+        # Estimate β
+        β_fluctuated = B(Ψ_fluctuated, Q_fluctuated)
+        
+        if include_prior == true
+            # Priors
+            for i = 1:p
+                target += loglikelihood(prior, β_fluctuated[i])
+            end
+
+            # Jacobian adjustment
+
+            jacobian = dB_dΨ(Ψ_fluctuated, Q_fluctuated, β_fluctuated)' * (clever1 .- clever0) +
+                dB_dQ(Ψ_fluctuated, Q_fluctuated, β_fluctuated)' * dQ_fluctuation_dϵ(ϵ, K, Q)
+
+            target += log(abs(det(jacobian)))
+        end
+
+        # Likelihood
+        for i in 1:n
+            if linear == true
+                target += loglikelihood(Normal(Q̄_fluctuated[i], s[i]), Y[i])
+            else
+                target += loglikelihood(Bernoulli(Q̄_fluctuated[i]), Y[i])
+            end
+        end
+
+        target += sum(log.(Q_fluctuated))
+
+        return (β_fluctuated, target)
+    end
+
+    function mle(s, Q̄, Q̄₀, Q̄₁, clever, clever0, clever1, K, Q, Y; linear = true)
+        Optim.minimizer(optimize(e -> -model(e, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q, Y; include_prior = false, linear = linear)[2], repeat([0.0], p)))
+    end
+
+    function yvariance(Q̄)
+        data[:, :Y2] = (data[:, :Y] - Q̄) .^ 2
+        y2_model = lm(var_formula, data)
+        s = predict(y2_model)
+        s = sqrt.(ifelse.(s .< 0, 1e-2, s))
+        return s
+    end
+
+    # Calculate variance parameter
+    s = repeat([1], n)
+    if linear == true
+        s = yvariance(Q̄)
+    end
+
+    Q̄_star  = Q̄ 
+    Q̄₀_star = Q̄₀
+    Q̄₁_star = Q̄₁
+    Q_star = Q
+    Ψ_star = Q̄₁_star - Q̄₀_star
+    β_star = B(Ψ_star, Q_star)
+    tmle_maxit = 100
+    ϵ = repeat([0.0], p)
+    for tmle_iter in 1:tmle_maxit
+        # Compute second clever covariate
+        K = zeros(n, p)
+        for i = 1:n
+            K[i, :] = dL(Ψ_star[i], β_star, X[i, :])
+        end
+
+        #ϵ = mle(repeat([1.0], n), Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
+        ϵ = mle(s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
+        
+        if linear == true
+            Q̄_star  = Q̄_star  .+ (s .^ 2) .* clever * ϵ
+            Q̄₀_star = Q̄₀_star .+ (s .^ 2) .* clever0 * ϵ
+            Q̄₁_star = Q̄₁_star .+ (s .^ 2) .* clever1 * ϵ
+        else 
+            Q̄_star  = inv_logit.(logit.(Q̄_star)  .+ clever  * ϵ)
+            Q̄₀_star = inv_logit.(logit.(Q̄₀_star) .+ clever0 * ϵ)
+            Q̄₁_star = inv_logit.(logit.(Q̄₁_star) .+ clever1 * ϵ)
+        end
+        Q_star = Q_fluctuation(ϵ, K, Q_star)
+        Ψ_star = Q̄₁_star - Q̄₀_star 
+        β_star = B(Ψ_star, Q_star)
+
+        if maximum(abs.(ϵ)) < 1e-7
+            break
+        end
+    end
+
+    #return f(ϵ) = model(ϵ, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
+    #return f(ϵ) = Q_fluctuation(ϵ, K, Q_star)
 
     Δ_star = Δ(H, Y, Q̄_star)
 
-    D_star = D(Ψ_star, Q̄_star, Q, g, β_star, Δ_star, X)
+    D_star = D(Ψ_star, Q̄_star, Q_star, g, β_star, Δ_star, X)
 
     β_star_se = mapslices(std, D_star, dims = 1)'
     β_star_lower = β_star .- quantile(Normal(), 0.975) .* β_star_se ./ sqrt(n)
     β_star_upper = β_star .+ quantile(Normal(), 0.975) .* β_star_se ./ sqrt(n)
 
-    # Bayesian TMLE
-    @model function linear_fluctuation(p, Q̄, Q̄₀, Q̄₁, clever, clever0, clever1, K, Q, Y)
-        s² ~ InverseGamma(2, 3)
-        ϵ ~ filldist(Uniform(-1, 1), p)
+    # Calculate variance parameter
+    s = yvariance(Q̄_star)
 
-        # Fluctuate Q̄
-        Q̄_fluctuated = Q̄ .+ clever * ϵ
-        Q̄₀_fluctuated = Q̄₀ .+ clever0 * ϵ
-        Q̄₁_fluctuated = Q̄₁ .+ clever1 * ϵ
-        
-        ## Fluctuate Q
-        Q_normalization = sum(exp.(K * ϵ) .* Q)
-        Q_fluctuated  = exp.(K * ϵ) .* Q ./ Q_normalization
-        
-        ## Estimate Ψ
-        Ψ_fluctuated = Q̄₁_fluctuated - Q̄₀_fluctuated
-
-        # Estimate β
-        β_fluctuated = B(Ψ_fluctuated, Q_fluctuated)
-        #for i = 1:p
-        #   Turing.@addlogprob! loglikelihood(Normal(0, 1), β_fluctuated[i])
-        #end
-
-        Y ~ MvNormal(Q̄_fluctuated, sqrt(s²))
-        Turing.@addlogprob! sum(log.(Q_fluctuated))
-
-        return β_fluctuated
-    end
-
-    # Compute second clever covariate
     K = zeros(n, p)
     for i = 1:n
         K[i, :] = dL(Ψ_star[i], β_star, X[i, :])
     end
 
-    Turing.setadbackend(:zygote)
-    model = linear_fluctuation(p, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q, Y)
-    samples = sample(
-        model,
-        NUTS(250, 0.95),
-        #MH(
-        #    :s => x -> TruncatedNormal(x, 0.01, 0, Inf),
-        #    :ϵ => AdvancedMH.RandomWalkProposal(MultivariateNormal(repeat([0.0], p), diagm(repeat([0.01, p]))))
-        #),
-        MCMCThreads(),
-        250, 
-        4,
-        init_params = vcat([0.1], repeat([0.0], p))
-    )
+    function metropolishastings(proposal_sd, iterations)
+        samples = zeros(iterations, p)
+        accepted = zeros(iterations)
+        ll = zeros(iterations)
+        β_post = zeros(iterations, p)
 
-    beta_post = generated_quantities(model, samples)
-    beta_post = mapreduce(permutedims, vcat, reshape(beta_post, prod(size(beta_post)), 1))
-    beta_cis = mapslices(x -> quantile(x, [0.025, 0.975]), beta_post, dims = [1])
+        samples[1, :] = repeat([0.0], p)
+        (β, ll1) = model(samples[1, :], s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
+        β_post[1, :] = β
+        ll[1] = ll1
+        accepted[1] = 0
+        uniform = Uniform(0, 1)
+
+        for i in 2:iterations
+            # Proposal
+            proposal = rand(rng, MvNormal(samples[i - 1, :], proposal_sd))
+            
+            (β, ll_proposal) = model(proposal, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
+            β_post[i, :] = β
+            ll[i] = ll_proposal
+
+            u = rand(rng, uniform)
+
+            logratio = ll[i] - ll[i - 1]
+
+            if logratio > log(u)
+                samples[i, :] = proposal
+                accepted[i] = 1
+            else
+                samples[i, :] = samples[i - 1, :]
+                β_post[i, :] = β_post[i - 1, :]
+                ll[i] = ll[i - 1]
+                accepted[i] = 0
+            end
+
+            if i % 5_000 == 0
+                println("MH Iteration ", i, "/", iterations)
+            end
+        end
+
+        return (β_post, samples, mean(accepted))
+    end
+
+    β_post = nothing
+    β_star_lower_bayes = nothing
+    β_star_upper_bayes = nothing
+    ϵ_post = nothing
+    accepted = nothing
+    β_star_bayes = nothing
+
+    if bayes == true
+        if proposal_sd === nothing
+            # Estimate proposal sd
+            println("Tuning Metropolis Hastings")
+            current_accepted = 0.0
+            max_tuning_iters = 20
+            upper = 0.5
+            lower = 0
+            for iter in 1:max_tuning_iters
+                proposal_sd = (upper + lower) / 2
+                (_, _, new_accepted) = metropolishastings(proposal_sd, 1000)
+                println("Proposal sd: ", proposal_sd, " acceptance: ", new_accepted)
+                
+                if new_accepted > 0.3 && new_accepted < 0.4
+                    println("Accepting proposal sd ", proposal_sd, " with acceptance ", new_accepted)
+                    break;
+                elseif new_accepted >= 0.4
+                    lower = proposal_sd
+                else
+                    upper = proposal_sd
+                end
+
+                current_accepted = new_accepted
+            end
+        end
+
+        println("Running Metropolis Hastings")
+        (β_post, ϵ_post, accepted) = metropolishastings(proposal_sd, iterations)
+
+        β_star_bayes       = mapslices(x -> quantile(x, 0.5), β_post, dims = 1)'
+        β_star_lower_bayes = mapslices(x -> quantile(x, 0.025), β_post, dims = 1)'
+        β_star_upper_bayes = mapslices(x -> quantile(x, 0.975), β_post, dims = 1)'
+    end
 
     return (
         epsilon = ϵ,
@@ -203,10 +396,12 @@ function treatment_effect_modification(Y, A, X, g_formula, Q̄_formula, p, L::Fu
         beta_se = β_star_se,
         beta_lower = β_star_lower,
         beta_upper = β_star_upper,
-        beta_post = beta_post,
-        beta_lower_bayes = beta_cis[1, :],
-        beta_upper_bayes = beta_cis[2, :],
-        samples = samples
+        beta_post = β_post,
+        beta_bayes = β_star_bayes,
+        beta_lower_bayes = β_star_lower_bayes,
+        beta_upper_bayes = β_star_upper_bayes,
+        epsilon_post = ϵ_post,
+        accepted = accepted
     )
 end
 
