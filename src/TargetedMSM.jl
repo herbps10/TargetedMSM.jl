@@ -26,10 +26,10 @@ function treatment_effect_modification(
     X, 
     g_formula, 
     Q̄_formula, 
-    var_formula, 
     p, 
     L::Function, 
     m::Function;
+    var_formula = nothing, 
     linear = true,
     bayes = false,
     iterations::Int = 10_000, 
@@ -131,6 +131,29 @@ function treatment_effect_modification(
         return eif
     end
 
+    function calculate_clever(H, H₀, H₁, Ψ, β, X)
+        clever = zeros(n, p)
+        clever0 = zeros(n, p)
+        clever1 = zeros(n, p)
+
+        for i in 1:n
+            d = ∇dL(Ψ[i], β, X[i, :])
+            clever[i, :] = H[i] .* d
+            clever0[i, :] = H₀[i] .* d
+            clever1[i, :] = H₁[i] .* d
+        end
+
+        return (clever, clever0, clever1)
+    end
+    
+    function calculate_K(Ψ, β, X)
+        K = zeros(n, p)
+        for i = 1:n
+            K[i, :] = dL(Ψ[i], β, X[i, :])
+        end
+        return K
+    end
+
     # Combine all data
     data  = hcat(DataFrame(Y = Y, A = A), X)
     data0 = hcat(DataFrame(Y = Y, A = repeat([0.0], n)), X)
@@ -161,16 +184,6 @@ function treatment_effect_modification(
     H₁ =  1 ./ (g)
     H  = ifelse.(A .== 1, H₁, H₀)
 
-    clever = zeros(n, p)
-    clever0 = zeros(n, p)
-    clever1 = zeros(n, p)
-
-    for i in 1:n
-        d = ∇dL(Ψ[i], β_plugin, X[i, :])
-        clever[i, :] = H[i] .* d
-        clever0[i, :] = H₀[i] .* d
-        clever1[i, :] = H₁[i] .* d
-    end
 
     function Q_fluctuation(ϵ, K, Q)
         Q_normalization = sum(exp.(K * ϵ) .* Q)
@@ -245,9 +258,11 @@ function treatment_effect_modification(
         return s
     end
 
+    
+
     # Calculate variance parameter
     s = repeat([1], n)
-    if linear == true
+    if linear == true && bayes == true
         s = yvariance(Q̄)
     end
 
@@ -260,11 +275,9 @@ function treatment_effect_modification(
     tmle_maxit = 100
     ϵ = repeat([0.0], p)
     for tmle_iter in 1:tmle_maxit
-        # Compute second clever covariate
-        K = zeros(n, p)
-        for i = 1:n
-            K[i, :] = dL(Ψ_star[i], β_star, X[i, :])
-        end
+        # Update second clever covariate
+        K = calculate_K(Ψ_star, β_star, X)
+        (clever, clever0, clever1) = calculate_clever(H, H₀, H₁, Ψ_star, β_star, X)
 
         #ϵ = mle(repeat([1.0], n), Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
         ϵ = mle(s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
@@ -278,6 +291,7 @@ function treatment_effect_modification(
             Q̄₀_star = inv_logit.(logit.(Q̄₀_star) .+ clever0 * ϵ)
             Q̄₁_star = inv_logit.(logit.(Q̄₁_star) .+ clever1 * ϵ)
         end
+
         Q_star = Q_fluctuation(ϵ, K, Q_star)
         Ψ_star = Q̄₁_star - Q̄₀_star 
         β_star = B(Ψ_star, Q_star)
@@ -287,23 +301,26 @@ function treatment_effect_modification(
         end
     end
 
-    #return f(ϵ) = model(ϵ, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
+    return f(ϵ) = model(ϵ, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
     #return f(ϵ) = Q_fluctuation(ϵ, K, Q_star)
 
+    # Calculate EIF
     Δ_star = Δ(H, Y, Q̄_star)
 
     D_star = D(Ψ_star, Q̄_star, Q_star, g, β_star, Δ_star, X)
 
+    # Calculate 95% confidence intervals
     β_star_se = mapslices(std, D_star, dims = 1)'
     β_star_lower = β_star .- quantile(Normal(), 0.975) .* β_star_se ./ sqrt(n)
     β_star_upper = β_star .+ quantile(Normal(), 0.975) .* β_star_se ./ sqrt(n)
 
-    # Calculate variance parameter
-    s = yvariance(Q̄_star)
+    # Update clever covariates
+    K = calculate_K(Ψ_star, β_star, X)
+    (clever, clever0, clever1) = calculate_clever(H, H₀, H₁, Ψ_star, β_star, X)
 
-    K = zeros(n, p)
-    for i = 1:n
-        K[i, :] = dL(Ψ_star[i], β_star, X[i, :])
+    # Calculate variance parameter
+    if linear == true && bayes == true
+        s = yvariance(Q̄_star)
     end
 
     function metropolishastings(proposal_sd, iterations)
@@ -362,7 +379,7 @@ function treatment_effect_modification(
             println("Tuning Metropolis Hastings")
             current_accepted = 0.0
             max_tuning_iters = 20
-            upper = 0.5
+            upper = 1
             lower = 0
             for iter in 1:max_tuning_iters
                 proposal_sd = (upper + lower) / 2
