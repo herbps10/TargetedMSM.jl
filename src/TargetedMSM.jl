@@ -9,10 +9,7 @@ using Distributions
 using Random
 using NLsolve
 using Optim
-
-
-logit(p) = log(p / (1 - p))
-inv_logit(p) = exp(p) / (exp(p) + 1)
+using StatsFuns
 
 """
     tmle(data, p::Integer, L, m, ℒ)
@@ -25,10 +22,14 @@ function treatment_effect_modification(
     A, 
     X, 
     g_formula, 
-    Q̄_formula, 
+    Qbar_formula, 
     p, 
     L::Function, 
     m::Function;
+    Qbar = nothing,
+    Qbar0 = nothing,
+    Qbar1 = nothing,
+    g = nothing,
     var_formula = nothing, 
     linear = true,
     bayes = false,
@@ -116,12 +117,17 @@ function treatment_effect_modification(
         H .* (Y .- Q̄)
     end
 
-    function D(Ψ, Q̄, Q, g, β, Δ, X) 
+    function normalizing_matrix(Ψ, Q, β, X)
         M = zeros(p, p)
         for i in 1:n
             M += Q[i] .* ddL(Ψ[i], β, X[i, :])
         end
         M⁻¹ = inv(M)
+        return M⁻¹ 
+    end
+
+    function D(Ψ, Q̄, Q, g, β, Δ, X) 
+        M⁻¹ = normalizing_matrix(Ψ, Q, β, X)
 
         eif = zeros(n, p)
         for i in 1:n
@@ -131,13 +137,15 @@ function treatment_effect_modification(
         return eif
     end
 
-    function calculate_clever(H, H₀, H₁, Ψ, β, X)
+    function calculate_clever(H, H₀, H₁, Ψ, Q, β, X)
         clever = zeros(n, p)
         clever0 = zeros(n, p)
         clever1 = zeros(n, p)
+        
+        M⁻¹ = normalizing_matrix(Ψ, Q, β, X)
 
         for i in 1:n
-            d = ∇dL(Ψ[i], β, X[i, :])
+            d = M⁻¹ * ∇dL(Ψ[i], β, X[i, :]) 
             clever[i, :] = H[i] .* d
             clever0[i, :] = H₀[i] .* d
             clever1[i, :] = H₁[i] .* d
@@ -146,10 +154,11 @@ function treatment_effect_modification(
         return (clever, clever0, clever1)
     end
     
-    function calculate_K(Ψ, β, X)
+    function calculate_K(Ψ, Q, β, X)
+        M⁻¹ = normalizing_matrix(Ψ, Q, β, X)
         K = zeros(n, p)
         for i = 1:n
-            K[i, :] = dL(Ψ[i], β, X[i, :])
+            K[i, :] = M⁻¹ * dL(Ψ[i], β, X[i, :]) 
         end
         return K
     end
@@ -160,19 +169,27 @@ function treatment_effect_modification(
     data1 = hcat(DataFrame(Y = Y, A = repeat([1.0], n)), X)
 
     # Estimate g and get initial predictions
-    g_model = glm(g_formula, data, Bernoulli(), LogitLink())
-    g = predict(g_model)
-
-    # Estimate Q̄
-    if linear == true
-        Q̄_model = lm(Q̄_formula, data)
-    else 
-        Q̄_model = glm(Q̄_formula, data, Bernoulli(), LogitLink())
+    if g == nothing
+        g_model = glm(g_formula, data, Bernoulli(), LogitLink())
+        g = predict(g_model)
     end
 
-    Q̄  = predict(Q̄_model)
-    Q̄₀ = predict(Q̄_model, data0)
-    Q̄₁ = predict(Q̄_model, data1)
+    # Estimate Q̄
+    if Qbar === nothing
+        if linear == true
+            Q̄_model = lm(Qbar_formula, data)
+        else 
+            Q̄_model = glm(Qbar_formula, data, Bernoulli(), LogitLink())
+        end
+
+        Q̄  = predict(Q̄_model)
+        Q̄₀ = predict(Q̄_model, data0)
+        Q̄₁ = predict(Q̄_model, data1)
+    else
+        Q̄ = Qbar
+        Q̄₀ = Qbar0
+        Q̄₁ = Qbar1
+    end
 
     Ψ = Q̄₁ - Q̄₀
 
@@ -183,7 +200,6 @@ function treatment_effect_modification(
     H₀ = -1 ./ (1. .- g)
     H₁ =  1 ./ (g)
     H  = ifelse.(A .== 1, H₁, H₀)
-
 
     function Q_fluctuation(ϵ, K, Q)
         Q_normalization = sum(exp.(K * ϵ) .* Q)
@@ -205,9 +221,9 @@ function treatment_effect_modification(
             Q̄₀_fluctuated = Q̄₀ .+ (s .^ 2) .* clever0 * ϵ
             Q̄₁_fluctuated = Q̄₁ .+ (s .^ 2) .* clever1 * ϵ 
         else
-            Q̄_fluctuated  = inv_logit.(logit.(Q̄)  .+ clever * ϵ)
-            Q̄₀_fluctuated = inv_logit.(logit.(Q̄₀) .+ clever0 * ϵ)
-            Q̄₁_fluctuated = inv_logit.(logit.(Q̄₁) .+ clever1 * ϵ)
+            Q̄_fluctuated  = logistic.(logit.(Q̄)  .+ clever * ϵ)
+            Q̄₀_fluctuated = logistic.(logit.(Q̄₀) .+ clever0 * ϵ)
+            Q̄₁_fluctuated = logistic.(logit.(Q̄₁) .+ clever1 * ϵ)
         end
 
         # Estimate Ψ
@@ -247,7 +263,7 @@ function treatment_effect_modification(
     end
 
     function mle(s, Q̄, Q̄₀, Q̄₁, clever, clever0, clever1, K, Q, Y; linear = true)
-        Optim.minimizer(optimize(e -> -model(e, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q, Y; include_prior = false, linear = linear)[2], repeat([0.0], p)))
+        Optim.minimizer(optimize(e -> -model(e, s, Q̄, Q̄₀, Q̄₁, clever, clever0, clever1, K, Q, Y; include_prior = false, linear = linear)[2], repeat([0.0], p)))
     end
 
     function yvariance(Q̄)
@@ -257,8 +273,6 @@ function treatment_effect_modification(
         s = sqrt.(ifelse.(s .< 0, 1e-2, s))
         return s
     end
-
-    
 
     # Calculate variance parameter
     s = repeat([1], n)
@@ -275,24 +289,27 @@ function treatment_effect_modification(
     tmle_maxit = 100
     ϵ = repeat([0.0], p)
     for tmle_iter in 1:tmle_maxit
+        println(tmle_iter)
         # Update second clever covariate
-        K = calculate_K(Ψ_star, β_star, X)
-        (clever, clever0, clever1) = calculate_clever(H, H₀, H₁, Ψ_star, β_star, X)
+        K = calculate_K(Ψ_star, Q_star, β_star, X)
+        (clever, clever0, clever1) = calculate_clever(H, H₀, H₁, Ψ_star, Q_star, β_star, X)
 
         #ϵ = mle(repeat([1.0], n), Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
         ϵ = mle(s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
+        print(ϵ)
         
         if linear == true
             Q̄_star  = Q̄_star  .+ (s .^ 2) .* clever * ϵ
             Q̄₀_star = Q̄₀_star .+ (s .^ 2) .* clever0 * ϵ
             Q̄₁_star = Q̄₁_star .+ (s .^ 2) .* clever1 * ϵ
         else 
-            Q̄_star  = inv_logit.(logit.(Q̄_star)  .+ clever  * ϵ)
-            Q̄₀_star = inv_logit.(logit.(Q̄₀_star) .+ clever0 * ϵ)
-            Q̄₁_star = inv_logit.(logit.(Q̄₁_star) .+ clever1 * ϵ)
+            Q̄_star  = logistic.(logit.(Q̄_star)  .+ clever  * ϵ)
+            Q̄₀_star = logistic.(logit.(Q̄₀_star) .+ clever0 * ϵ)
+            Q̄₁_star = logistic.(logit.(Q̄₁_star) .+ clever1 * ϵ)
         end
 
-        Q_star = Q_fluctuation(ϵ, K, Q_star)
+        #Q_star = Q_fluctuation(ϵ, K, Q_star)
+        Q_star = Q
         Ψ_star = Q̄₁_star - Q̄₀_star 
         β_star = B(Ψ_star, Q_star)
 
@@ -301,7 +318,7 @@ function treatment_effect_modification(
         end
     end
 
-    return f(ϵ) = model(ϵ, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
+    #return f(ϵ) = model(ϵ, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
     #return f(ϵ) = Q_fluctuation(ϵ, K, Q_star)
 
     # Calculate EIF
@@ -315,8 +332,8 @@ function treatment_effect_modification(
     β_star_upper = β_star .+ quantile(Normal(), 0.975) .* β_star_se ./ sqrt(n)
 
     # Update clever covariates
-    K = calculate_K(Ψ_star, β_star, X)
-    (clever, clever0, clever1) = calculate_clever(H, H₀, H₁, Ψ_star, β_star, X)
+    K = calculate_K(Ψ_star, Q_star, β_star, X)
+    (clever, clever0, clever1) = calculate_clever(H, H₀, H₁, Ψ_star, Q_star, β_star, X)
 
     # Calculate variance parameter
     if linear == true && bayes == true
@@ -379,7 +396,7 @@ function treatment_effect_modification(
             println("Tuning Metropolis Hastings")
             current_accepted = 0.0
             max_tuning_iters = 20
-            upper = 1
+            upper = 0.2
             lower = 0
             for iter in 1:max_tuning_iters
                 proposal_sd = (upper + lower) / 2
@@ -418,7 +435,10 @@ function treatment_effect_modification(
         beta_lower_bayes = β_star_lower_bayes,
         beta_upper_bayes = β_star_upper_bayes,
         epsilon_post = ϵ_post,
-        accepted = accepted
+        accepted = accepted,
+        Psi = Ψ,
+        Psi_star = Ψ_star,
+        D_star = Δ_star
     )
 end
 
