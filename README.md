@@ -1,6 +1,6 @@
 # TargetedMSM.jl
 
-`TargetedMSM.jl` is a Julia package that implements the targeted Marginal Structural Model (MSM) estimators described in Susmann & Chambaz (2022).
+`TargetedMSM.jl` is a Julia package that implements the targeted Marginal Structural Model (MSM) estimators described in Susmann & Chambaz (2022, forthcoming).
 
 Note that this is research software. The API and implementation is subject to change.
 
