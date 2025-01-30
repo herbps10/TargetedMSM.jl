@@ -211,7 +211,6 @@ function treatment_effect_modification(
         return Q_fluctuation(ϵ, K, Q) .* (K .- Q .* K .* exp.(K * ϵ) ./ Q_normalization)
     end
 
-    # TODO: logistic response model
     function model(ϵ, s, Q̄, Q̄₀, Q̄₁, clever, clever0, clever1, K, Q, Y; include_prior = false, linear = true)
         target = 0
 
@@ -289,14 +288,12 @@ function treatment_effect_modification(
     tmle_maxit = 100
     ϵ = repeat([0.0], p)
     for tmle_iter in 1:tmle_maxit
-        println(tmle_iter)
         # Update second clever covariate
         K = calculate_K(Ψ_star, Q_star, β_star, X)
         (clever, clever0, clever1) = calculate_clever(H, H₀, H₁, Ψ_star, Q_star, β_star, X)
 
         #ϵ = mle(repeat([1.0], n), Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
         ϵ = mle(s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, linear = linear)
-        print(ϵ)
         
         if linear == true
             Q̄_star  = Q̄_star  .+ (s .^ 2) .* clever * ϵ
@@ -356,6 +353,8 @@ function treatment_effect_modification(
         for i in 2:iterations
             # Proposal
             proposal = rand(rng, MvNormal(samples[i - 1, :], proposal_sd))
+
+            print(proposal)
             
             (β, ll_proposal) = model(proposal, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
             β_post[i, :] = β
@@ -426,6 +425,7 @@ function treatment_effect_modification(
 
     return (
         epsilon = ϵ,
+        beta_plugin = β_plugin,
         beta = β_star,
         beta_se = β_star_se,
         beta_lower = β_star_lower,
