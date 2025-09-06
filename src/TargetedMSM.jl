@@ -39,7 +39,8 @@ function treatment_effect_modification(
     include_prior = true, 
     prior = Normal(0, 1),
     dL = nothing,
-    dL_dβ = nothing
+    dL_dβ = nothing,
+    range_threshold = 0.1,
 )
 
     rng = MersenneTwister(seed)
@@ -258,6 +259,11 @@ function treatment_effect_modification(
 
         target += sum(log.(Q_fluctuated))
 
+        if isinf(target)
+          β_fluctuated = repeat([0.0], length(ϵ))
+          target = (target < 0) -1e8 : 1e8
+        end
+
         return (β_fluctuated, target)
     end
 
@@ -337,6 +343,16 @@ function treatment_effect_modification(
         s = yvariance(Q̄_star)
     end
 
+    # Estimate marginal range of fluctuation model
+    beta_mins = repeat([0.0], p)
+    beta_maxes = repeat([0.0], p)
+    for i in 1:p
+      fmin = optimize(e -> model(e, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y; include_prior = true, linear = linear)[1][i], repeat([0.0], p))
+      fmax = optimize(e -> -1.0 * model(e, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y; include_prior = true, linear = linear)[1][i], repeat([0.0], p))
+      beta_mins[i]  = Optim.minimum(fmin)[1]
+      beta_maxes[i]  = -1 * Optim.minimum(fmax)[1]
+    end
+
     function metropolishastings(proposal_sd, iterations)
         samples = zeros(iterations, p)
         accepted = zeros(iterations)
@@ -354,8 +370,6 @@ function treatment_effect_modification(
             # Proposal
             proposal = rand(rng, MvNormal(samples[i - 1, :], proposal_sd))
 
-            print(proposal)
-            
             (β, ll_proposal) = model(proposal, s, Q̄_star, Q̄₀_star, Q̄₁_star, clever, clever0, clever1, K, Q_star, Y, include_prior = include_prior, linear = linear)
             β_post[i, :] = β
             ll[i] = ll_proposal
@@ -423,6 +437,15 @@ function treatment_effect_modification(
         β_star_upper_bayes = mapslices(x -> quantile(x, 0.975), β_post, dims = 1)'
     end
 
+    # Check if any of the posterior draws are near the endpoints of the range
+    # of the fluctuation model
+    for i in 1:p
+      print("beta[$(i)]: posterior range $(round(minimum(β_post[:, i]), sigdigits = 2)) - $(round(maximum(β_post[:, i]), sigdigits = 2)). Fluctuation model range: $(round(beta_mins[i], sigdigits = 2)) - $(round(beta_maxes[i], sigdigits = 2)).\n")
+      if abs(maximum(β_post[:, i]) - beta_maxes[i]) < range_threshold || abs(minimum(β_post[:, i]) - beta_mins[i]) < range_threshold
+        @warn "Posterior distribution for beta may be skewed due to choice of fluctuation model"
+      end
+    end
+
     return (
         epsilon = ϵ,
         beta_plugin = β_plugin,
@@ -434,6 +457,8 @@ function treatment_effect_modification(
         beta_bayes = β_star_bayes,
         beta_lower_bayes = β_star_lower_bayes,
         beta_upper_bayes = β_star_upper_bayes,
+        beta_mins = beta_mins,
+        beta_maxes = beta_maxes,
         epsilon_post = ϵ_post,
         accepted = accepted,
         Psi = Ψ,
